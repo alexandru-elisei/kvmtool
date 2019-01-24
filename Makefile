@@ -167,7 +167,8 @@ ifeq ($(ARCH), arm)
 	OBJS		+= arm/aarch32/kvm-cpu.o
 	ARCH_INCLUDE	:= $(HDRS_ARM_COMMON)
 	ARCH_INCLUDE	+= -Iarm/aarch32/include
-	CFLAGS		+= -march=armv7-a
+	CFLAGS		+= -march=armv7-a -I$(FDT_LIBDIR)
+	LDFLAGS		+= -L$(FDT_LIBDIR)
 
 	ARCH_WANT_LIBFDT := y
 endif
@@ -180,6 +181,8 @@ ifeq ($(ARCH), arm64)
 	OBJS		+= arm/aarch64/kvm-cpu.o
 	ARCH_INCLUDE	:= $(HDRS_ARM_COMMON)
 	ARCH_INCLUDE	+= -Iarm/aarch64/include
+	CFLAGS		+= -I$(FDT_LIBDIR)
+	LDFLAGS		+= -L$(FDT_LIBDIR)
 
 	ARCH_WANT_LIBFDT := y
 endif
@@ -312,14 +315,10 @@ $(warning No static libc found. Skipping guest init)
 endif
 
 ifeq (y,$(ARCH_WANT_LIBFDT))
-	ifneq ($(call try-build,$(SOURCE_LIBFDT),$(CFLAGS),-lfdt),y)
-          $(error No libfdt found. Please install libfdt-dev package)
-	else
-		CFLAGS_DYNOPT	+= -DCONFIG_HAS_LIBFDT
-		CFLAGS_STATOPT	+= -DCONFIG_HAS_LIBFDT
-		LIBS_DYNOPT	+= -lfdt
-		LIBS_STATOPT	+= -lfdt
-	endif
+	CFLAGS_DYNOPT	+= -DCONFIG_HAS_LIBFDT
+	CFLAGS_STATOPT	+= -DCONFIG_HAS_LIBFDT
+	LIBS_DYNOPT	+= -lfdt
+	LIBS_STATOPT	+= -lfdt
 endif
 
 ifeq ($(call try-build,$(SOURCE_HELLO),$(CFLAGS),-no-pie),y)
