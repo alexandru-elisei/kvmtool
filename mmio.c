@@ -1,7 +1,7 @@
 #include "kvm/kvm.h"
 #include "kvm/kvm-cpu.h"
 #include "kvm/rbtree-interval.h"
-#include "kvm/brlock.h"
+#include "kvm/mutex.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,10 +15,14 @@
 
 #define mmio_node(n) rb_entry(n, struct mmio_mapping, node)
 
+static DEFINE_MUTEX(mmio_lock);
+
 struct mmio_mapping {
 	struct rb_int_node	node;
 	void			(*mmio_fn)(struct kvm_cpu *vcpu, u64 addr, u8 *data, u32 len, u8 is_write, void *ptr);
 	void			*ptr;
+	u32			refcount;
+	bool			remove;
 };
 
 static struct rb_root mmio_tree = RB_ROOT;
@@ -51,12 +55,52 @@ static int mmio_insert(struct rb_root *root, struct mmio_mapping *data)
 	return rb_int_insert(root, &data->node);
 }
 
+static void mmio_remove(struct rb_root *root, struct mmio_mapping *data)
+{
+	rb_int_erase(root, &data->node);
+}
+
 static const char *to_direction(u8 is_write)
 {
 	if (is_write)
 		return "write";
 
 	return "read";
+}
+
+static struct mmio_mapping *mmio_get(struct rb_root *root, u64 phys_addr, u32 len)
+{
+	struct mmio_mapping *mmio;
+
+	mutex_lock(&mmio_lock);
+	mmio = mmio_search(root, phys_addr, len);
+	if (mmio)
+		mmio->refcount++;
+	mutex_unlock(&mmio_lock);
+
+	return mmio;
+}
+
+/* Called with mmio_lock held. */
+static void mmio_deregister(struct kvm *kvm, struct rb_root *root, struct mmio_mapping *mmio)
+{
+	struct kvm_coalesced_mmio_zone zone = (struct kvm_coalesced_mmio_zone) {
+		.addr	= rb_int_start(&mmio->node),
+		.size	= 1,
+	};
+	ioctl(kvm->vm_fd, KVM_UNREGISTER_COALESCED_MMIO, &zone);
+
+	mmio_remove(root, mmio);
+	free(mmio);
+}
+
+static void mmio_put(struct kvm *kvm, struct rb_root *root, struct mmio_mapping *mmio)
+{
+	mutex_lock(&mmio_lock);
+	mmio->refcount--;
+	if (mmio->remove && mmio->refcount == 0)
+		mmio_deregister(kvm, root, mmio);
+	mutex_unlock(&mmio_lock);
 }
 
 int kvm__register_mmio(struct kvm *kvm, u64 phys_addr, u64 phys_addr_len, bool coalesce,
@@ -72,9 +116,11 @@ int kvm__register_mmio(struct kvm *kvm, u64 phys_addr, u64 phys_addr_len, bool c
 		return -ENOMEM;
 
 	*mmio = (struct mmio_mapping) {
-		.node = RB_INT_INIT(phys_addr, phys_addr + phys_addr_len),
-		.mmio_fn = mmio_fn,
-		.ptr	= ptr,
+		.node		= RB_INT_INIT(phys_addr, phys_addr + phys_addr_len),
+		.mmio_fn	= mmio_fn,
+		.ptr		= ptr,
+		.refcount	= 0,
+		.remove		= false,
 	};
 
 	if (coalesce) {
@@ -88,9 +134,9 @@ int kvm__register_mmio(struct kvm *kvm, u64 phys_addr, u64 phys_addr_len, bool c
 			return -errno;
 		}
 	}
-	br_write_lock(kvm);
+	mutex_lock(&mmio_lock);
 	ret = mmio_insert(&mmio_tree, mmio);
-	br_write_unlock(kvm);
+	mutex_unlock(&mmio_lock);
 
 	return ret;
 }
@@ -98,25 +144,20 @@ int kvm__register_mmio(struct kvm *kvm, u64 phys_addr, u64 phys_addr_len, bool c
 bool kvm__deregister_mmio(struct kvm *kvm, u64 phys_addr)
 {
 	struct mmio_mapping *mmio;
-	struct kvm_coalesced_mmio_zone zone;
 
-	br_write_lock(kvm);
+	mutex_lock(&mmio_lock);
 	mmio = mmio_search_single(&mmio_tree, phys_addr);
 	if (mmio == NULL) {
-		br_write_unlock(kvm);
+		mutex_unlock(&mmio_lock);
 		return false;
 	}
 
-	zone = (struct kvm_coalesced_mmio_zone) {
-		.addr	= phys_addr,
-		.size	= 1,
-	};
-	ioctl(kvm->vm_fd, KVM_UNREGISTER_COALESCED_MMIO, &zone);
+	if (mmio->refcount)
+		mmio->remove = true;
+	else
+		mmio_deregister(kvm, &mmio_tree, mmio);
+	mutex_unlock(&mmio_lock);
 
-	rb_int_erase(&mmio_tree, &mmio->node);
-	br_write_unlock(kvm);
-
-	free(mmio);
 	return true;
 }
 
@@ -124,18 +165,18 @@ bool kvm__emulate_mmio(struct kvm_cpu *vcpu, u64 phys_addr, u8 *data, u32 len, u
 {
 	struct mmio_mapping *mmio;
 
-	br_read_lock(vcpu->kvm);
-	mmio = mmio_search(&mmio_tree, phys_addr, len);
-
-	if (mmio)
-		mmio->mmio_fn(vcpu, phys_addr, data, len, is_write, mmio->ptr);
-	else {
+	mmio = mmio_get(&mmio_tree, phys_addr, len);
+	if (!mmio) {
 		if (vcpu->kvm->cfg.mmio_debug)
 			fprintf(stderr,	"Warning: Ignoring MMIO %s at %016llx (length %u)\n",
 				to_direction(is_write),
 				(unsigned long long)phys_addr, len);
+		goto out;
 	}
-	br_read_unlock(vcpu->kvm);
 
+	mmio->mmio_fn(vcpu, phys_addr, data, len, is_write, mmio->ptr);
+	mmio_put(vcpu->kvm, &mmio_tree, mmio);
+
+out:
 	return true;
 }
