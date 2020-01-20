@@ -27,6 +27,7 @@
 #include "kvm/irq.h"
 #include "kvm/kvm.h"
 #include "kvm/pci.h"
+#include "kvm/vfio.h"
 #include "kvm/rtc.h"
 #include "kvm/sdl.h"
 #include "kvm/vnc.h"

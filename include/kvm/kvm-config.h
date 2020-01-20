@@ -2,7 +2,6 @@
 #define KVM_CONFIG_H_
 
 #include "kvm/disk-image.h"
-#include "kvm/vfio.h"
 #include "kvm/kvm-config-arch.h"
 
 #define DEFAULT_KVM_DEV		"/dev/kvm"
@@ -18,6 +17,7 @@
 #define MIN_RAM_SIZE_MB		(64ULL)
 #define MIN_RAM_SIZE_BYTE	(MIN_RAM_SIZE_MB << MB_SHIFT)
 
+struct vfio_device_params;
 struct kvm_config {
 	struct kvm_config_arch arch;
 	struct disk_image_params disk_image[MAX_DISK_IMAGES];

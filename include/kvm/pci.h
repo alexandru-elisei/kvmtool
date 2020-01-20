@@ -10,6 +10,7 @@
 #include "kvm/devices.h"
 #include "kvm/msi.h"
 #include "kvm/fdt.h"
+#include "kvm.h"
 
 #define pci_dev_err(pci_hdr, fmt, ...) \
 	pr_err("[%04x:%04x] " fmt, pci_hdr->vendor_id, pci_hdr->device_id, ##__VA_ARGS__)
@@ -32,9 +33,41 @@
 #define PCI_CONFIG_BUS_FORWARD	0xcfa
 #define PCI_IO_SIZE		0x100
 #define PCI_IOPORT_START	0x6200
-#define PCI_CFG_SIZE		(1ULL << 24)
 
-struct kvm;
+#define PCIE_CAP_REG_VER	0x1
+#define PCIE_CAP_REG_DEV_LEGACY	(1 << 4)
+#define PM_CAP_VER		0x3
+
+#ifdef ARCH_HAS_PCI_EXP
+#define PCI_CFG_SIZE		(1ULL << 28)
+#define PCI_DEV_CFG_SIZE	4096
+
+union pci_config_address {
+	struct {
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		unsigned	reg_offset	: 2;		/* 1  .. 0  */
+		unsigned	register_number	: 10;		/* 11 .. 2  */
+		unsigned	function_number	: 3;		/* 14 .. 12 */
+		unsigned	device_number	: 5;		/* 19 .. 15 */
+		unsigned	bus_number	: 8;		/* 27 .. 20 */
+		unsigned	reserved	: 3;		/* 30 .. 28 */
+		unsigned	enable_bit	: 1;		/* 31       */
+#else
+		unsigned	enable_bit	: 1;		/* 31       */
+		unsigned	reserved	: 3;		/* 30 .. 28 */
+		unsigned	bus_number	: 8;		/* 27 .. 20 */
+		unsigned	device_number	: 5;		/* 19 .. 15 */
+		unsigned	function_number	: 3;		/* 14 .. 12 */
+		unsigned	register_number	: 10;		/* 11 .. 2  */
+		unsigned	reg_offset	: 2;		/* 1  .. 0  */
+#endif
+	};
+	u32 w;
+};
+
+#else
+#define PCI_CFG_SIZE		(1ULL << 24)
+#define PCI_DEV_CFG_SIZE	256
 
 union pci_config_address {
 	struct {
@@ -58,6 +91,8 @@ union pci_config_address {
 	};
 	u32 w;
 };
+#endif
+#define PCI_DEV_CFG_MASK	(PCI_DEV_CFG_SIZE - 1)
 
 struct msix_table {
 	struct msi_msg msg;
@@ -100,6 +135,33 @@ struct pci_cap_hdr {
 	u8	next;
 };
 
+struct pcie_cap {
+	u8 cap;
+	u8 next;
+	u16 cap_reg;
+	u32 dev_cap;
+	u16 dev_ctrl;
+	u16 dev_status;
+	u32 link_cap;
+	u16 link_ctrl;
+	u16 link_status;
+	u32 slot_cap;
+	u16 slot_ctrl;
+	u16 slot_status;
+	u16 root_ctrl;
+	u16 root_cap;
+	u32 root_status;
+};
+
+struct pm_cap {
+	u8 cap;
+	u8 next;
+	u16 pmc;
+	u16 pmcsr;
+	u8 pmcsr_bse;
+	u8 data;
+};
+
 struct pci_device_header;
 
 typedef int (*bar_activate_fn_t)(struct kvm *kvm,
@@ -110,14 +172,12 @@ typedef int (*bar_deactivate_fn_t)(struct kvm *kvm,
 				   int bar_num, void *data);
 
 #define PCI_BAR_OFFSET(b)	(offsetof(struct pci_device_header, bar[b]))
-#define PCI_DEV_CFG_SIZE	256
-#define PCI_DEV_CFG_MASK	(PCI_DEV_CFG_SIZE - 1)
 
 struct pci_config_operations {
 	void (*write)(struct kvm *kvm, struct pci_device_header *pci_hdr,
-		      u8 offset, void *data, int sz);
+		      u16 offset, void *data, int sz);
 	void (*read)(struct kvm *kvm, struct pci_device_header *pci_hdr,
-		     u8 offset, void *data, int sz);
+		     u16 offset, void *data, int sz);
 };
 
 struct pci_device_header {
@@ -147,6 +207,10 @@ struct pci_device_header {
 			u8		min_gnt;
 			u8		max_lat;
 			struct msix_cap msix;
+#ifdef ARCH_HAS_PCI_EXP
+			struct pm_cap pm;
+			struct pcie_cap pcie;
+#endif
 		} __attribute__((packed));
 		/* Pad to PCI config space size */
 		u8	__pad[PCI_DEV_CFG_SIZE];
