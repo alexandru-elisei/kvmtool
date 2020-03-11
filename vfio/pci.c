@@ -8,6 +8,8 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 
+#include <assert.h>
+
 /* Wrapper around UAPI vfio_irq_set */
 union vfio_irq_eventfd {
 	struct vfio_irq_set	irq;
@@ -446,6 +448,81 @@ out_unlock:
 	mutex_unlock(&pdev->msi.mutex);
 }
 
+static int vfio_pci_bar_activate(struct kvm *kvm,
+				 struct pci_device_header *pci_hdr,
+				 int bar_num, void *data)
+{
+	struct vfio_device *vdev = data;
+	struct vfio_pci_device *pdev = &vdev->pci;
+	struct vfio_pci_msix_pba *pba = &pdev->msix_pba;
+	struct vfio_pci_msix_table *table = &pdev->msix_table;
+	struct vfio_region *region;
+	bool has_msix;
+	int ret;
+
+	assert((u32)bar_num < vdev->info.num_regions);
+
+	region = &vdev->regions[bar_num];
+	has_msix = pdev->irq_modes & VFIO_PCI_IRQ_MODE_MSIX;
+
+	if (has_msix && (u32)bar_num == table->bar) {
+		ret = kvm__register_mmio(kvm, table->guest_phys_addr,
+					 table->size, false,
+					 vfio_pci_msix_table_access, pdev);
+		if (ret < 0 || table->bar != pba->bar)
+			goto out;
+	}
+
+	if (has_msix && (u32)bar_num == pba->bar) {
+		ret = kvm__register_mmio(kvm, pba->guest_phys_addr,
+					 pba->size, false,
+					 vfio_pci_msix_pba_access, pdev);
+		goto out;
+	}
+
+	ret = vfio_map_region(kvm, vdev, region);
+out:
+	return ret;
+}
+
+static int vfio_pci_bar_deactivate(struct kvm *kvm,
+				   struct pci_device_header *pci_hdr,
+				   int bar_num, void *data)
+{
+	struct vfio_device *vdev = data;
+	struct vfio_pci_device *pdev = &vdev->pci;
+	struct vfio_pci_msix_pba *pba = &pdev->msix_pba;
+	struct vfio_pci_msix_table *table = &pdev->msix_table;
+	struct vfio_region *region;
+	bool has_msix, success;
+	int ret;
+
+	assert((u32)bar_num < vdev->info.num_regions);
+
+	region = &vdev->regions[bar_num];
+	has_msix = pdev->irq_modes & VFIO_PCI_IRQ_MODE_MSIX;
+
+	if (has_msix && (u32)bar_num == table->bar) {
+		success = kvm__deregister_mmio(kvm, table->guest_phys_addr);
+		/* kvm__deregister_mmio fails when the region is not found. */
+		ret = (success ? 0 : -ENOENT);
+		if (ret < 0 || table->bar!= pba->bar)
+			goto out;
+	}
+
+	if (has_msix && (u32)bar_num == pba->bar) {
+		success = kvm__deregister_mmio(kvm, pba->guest_phys_addr);
+		ret = (success ? 0 : -ENOENT);
+		goto out;
+	}
+
+	vfio_unmap_region(kvm, region);
+	ret = 0;
+
+out:
+	return ret;
+}
+
 static void vfio_pci_cfg_read(struct kvm *kvm, struct pci_device_header *pci_hdr,
 			      u8 offset, void *data, int sz)
 {
@@ -805,12 +882,6 @@ static int vfio_pci_create_msix_table(struct kvm *kvm, struct vfio_device *vdev)
 		ret = -ENOMEM;
 		goto out_free;
 	}
-	pba->guest_phys_addr = table->guest_phys_addr + table->size;
-
-	ret = kvm__register_mmio(kvm, table->guest_phys_addr, table->size,
-				 false, vfio_pci_msix_table_access, pdev);
-	if (ret < 0)
-		goto out_free;
 
 	/*
 	 * We could map the physical PBA directly into the guest, but it's
@@ -820,10 +891,7 @@ static int vfio_pci_create_msix_table(struct kvm *kvm, struct vfio_device *vdev)
 	 * between MSI-X table and PBA. For the sake of isolation, create a
 	 * virtual PBA.
 	 */
-	ret = kvm__register_mmio(kvm, pba->guest_phys_addr, pba->size, false,
-				 vfio_pci_msix_pba_access, pdev);
-	if (ret < 0)
-		goto out_free;
+	pba->guest_phys_addr = table->guest_phys_addr + table->size;
 
 	pdev->msix.entries = entries;
 	pdev->msix.nr_entries = nr_entries;
@@ -894,11 +962,6 @@ static int vfio_pci_configure_bar(struct kvm *kvm, struct vfio_device *vdev,
 		region->guest_phys_addr = pci_get_mmio_block(map_size);
 	}
 
-	/* Map the BARs into the guest or setup a trap region. */
-	ret = vfio_map_region(kvm, vdev, region);
-	if (ret)
-		return ret;
-
 	return 0;
 }
 
@@ -945,7 +1008,12 @@ static int vfio_pci_configure_dev_regions(struct kvm *kvm,
 	}
 
 	/* We've configured the BARs, fake up a Configuration Space */
-	return vfio_pci_fixup_cfg_space(vdev);
+	ret = vfio_pci_fixup_cfg_space(vdev);
+	if (ret)
+		return ret;
+
+	return pci__register_bar_regions(kvm, &pdev->hdr, vfio_pci_bar_activate,
+					 vfio_pci_bar_deactivate, vdev);
 }
 
 /*
